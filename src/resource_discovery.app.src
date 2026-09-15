@@ -2,7 +2,7 @@
  resource_discovery,
  [{description, "A distributed resource discovery system built with Erlang/OTP."},
   {vsn, "0.1.0"},
-  {registered, []},
+  {registered, [resource_discovery_server]},
   {mod, {resource_discovery_app, []}},
   {applications, [kernel, stdlib]},
-  {modules, [resource_discovery_app, resource_discovery_sup]}]}.
+  {modules, [resource_discovery_app, resource_discovery_server, resource_discovery_sup]}]}.

@@ -40,5 +40,11 @@ init([]) ->
         #{strategy => one_for_one,
           intensity => 1,
           period => 5},
-    ChildSpecs = [],
+    ChildSpecs =
+        [#{id => resource_discovery_server,
+           start => {resource_discovery_server, start_link, []},
+           restart => permanent,
+           shutdown => 5000,
+           type => worker,
+           modules => [resource_discovery_server]}],
     {ok, {SupFlags, ChildSpecs}}.
