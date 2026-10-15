@@ -23,17 +23,21 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/0, add_target_resource_type/1, add_local_resource/2,
-         fetch_resources/1, trade_resources/0]).
+-export([start_link/0, add_local_resource/2, add_target_resource/1, get_resources/1,
+         trade_resources/0]).
 %% Gen Server callbacks
 -export([init/1, handle_call/3, handle_cast/2, terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
+-define(TRADE_DELAY_TIME, 2500).
 
+-type resource_type() :: term().
+-type resource() :: term().
+-type resources() :: #{resource_type() => [resource()]}.
 -type state() ::
-    #{found_resources := map(),
-      local_resources := map(),
-      target_resources := list()}.
+    #{found_resources := resources(),
+      local_resources := resources(),
+      target_resources := [resource_type()]}.
 
 %%====================================================================
 %% API
@@ -44,25 +48,31 @@
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
-%% @doc Adds a resource type to the list of resources this node wants to discover.
--spec add_target_resource_type(term()) -> ok.
-add_target_resource_type(ResourceType) ->
-    gen_server:cast(?SERVER, {add_target_resource_type, ResourceType}).
+%% @doc Adds a resource type and the resource to local resources map available on this node.
+-spec add_local_resource(resource_type(), resource()) -> ok.
+add_local_resource(Type, Resource) ->
+    gen_server:call(?SERVER, {add_local_resource, {Type, Resource}}).
 
-%% @doc Adds a resource type and instance to local resources map available on this node.
--spec add_local_resource(term(), pid()) -> ok.
-add_local_resource(ResourceType, Instance) ->
-    gen_server:cast(?SERVER, {add_local_resource, {ResourceType, Instance}}).
+%% @doc Adds a resource to the list of resources this node wants to discover.
+-spec add_target_resource(resource_type()) -> ok.
+add_target_resource(Type) ->
+    gen_server:call(?SERVER, {add_target_resource, Type}).
 
 %% @doc Returns resources of the given type discovered in the cluster.
--spec fetch_resources(term()) -> list().
-fetch_resources(ResourceType) ->
-    gen_server:call(?SERVER, {fetch_resources, ResourceType}).
+-spec get_resources(resource_type()) -> [resource()].
+get_resources(Type) ->
+    gen_server:call(?SERVER, {get_resources, Type}).
 
-%% @doc Exchanges local resources with resource discovery servers on connected nodes.
+%% @doc Starts an exchange and waits five seconds as a best-effort synchronization delay.
 -spec trade_resources() -> ok.
 trade_resources() ->
-    gen_server:cast(?SERVER, trade_resources).
+    ok = gen_server:cast(?SERVER, trade_resources),
+    case nodes() of
+        [] ->
+            ok;
+        _ ->
+            timer:sleep(?TRADE_DELAY_TIME)
+    end.
 
 %%====================================================================
 %% Gen Server callbacks
@@ -75,48 +85,53 @@ init(_Args) ->
        local_resources => #{},
        target_resources => []}}.
 
--spec handle_call(tuple(), gen_server:from(), state()) -> {reply, list(), state()}.
-handle_call({fetch_resources, ResourceType},
+-spec handle_call(term(), gen_server:from(), state()) ->
+                     {reply, ok | [resource()] | {error, unsupported_request}, state()}.
+handle_call({add_local_resource, {Type, Resource}},
             _From,
-            #{found_resources := FoundResources} = State) ->
-    Resources = maps:get(ResourceType, FoundResources, []),
-    {reply, Resources, State}.
-
--spec handle_cast(tuple(), state()) -> {noreply, state()}.
-handle_cast({add_target_resource_type, ResourceType},
-            #{target_resources := TargetResources} = State) ->
-    NewTargetResources =
-        case lists:member(ResourceType, TargetResources) of
-            true ->
-                TargetResources;
-            false ->
-                [ResourceType | TargetResources]
-        end,
-    {noreply, State#{target_resources => NewTargetResources}};
-handle_cast({add_local_resource, {ResourceType, Resource}},
             #{local_resources := LocalResources} = State) ->
-    NewLocalResources = add_resource(ResourceType, Resource, LocalResources),
-    {noreply, State#{local_resources => NewLocalResources}};
-handle_cast(trade_resources, #{local_resources := LocalResources} = State) ->
-    lists:foreach(fun(Node) ->
-                     gen_server:cast({?SERVER, Node}, {trade_resources, {node(), LocalResources}})
-                  end,
-                  [node() | nodes()]),
-    {noreply, State};
-handle_cast({trade_resources, {ReplyTo, RemoteResources}},
+    NewLocalResources = add_resource_if_new(Type, Resource, LocalResources),
+    {reply, ok, State#{local_resources => NewLocalResources}};
+handle_call({add_target_resource, Type},
+            _From,
+            #{target_resources := TargetResources} = State) ->
+    NewTargetResources = add_unique_resource(Type, TargetResources),
+    {reply, ok, State#{target_resources => NewTargetResources}};
+handle_call({get_resources, Type}, _From, #{found_resources := FoundResources} = State) ->
+    ResourceList = maps:get(Type, FoundResources, []),
+    {reply, ResourceList, State};
+handle_call(_Request, _From, State) ->
+    {reply, {error, unsupported_request}, State}.
+
+-spec handle_cast(term(), state()) -> {noreply, state()}.
+handle_cast(trade_resources,
             #{found_resources := FoundResources,
               local_resources := LocalResources,
               target_resources := TargetResources} =
                 State) ->
-    NeededResources = resources_by_types(TargetResources, RemoteResources),
-    NewFoundResources = add_resources(NeededResources, FoundResources),
-    case ReplyTo of
+    NewResources = get_resources_by_types(TargetResources, LocalResources),
+    LocalFoundResources = add_resources_if_new(NewResources, FoundResources),
+    lists:foreach(fun(Node) ->
+                     gen_server:cast({?SERVER, Node}, {trade_resources, {node(), LocalResources}})
+                  end,
+                  nodes()),
+    {noreply, State#{found_resources => LocalFoundResources}};
+handle_cast({trade_resources, {From, RemoteResources}},
+            #{found_resources := FoundResources,
+              local_resources := LocalResources,
+              target_resources := TargetResources} =
+                State) ->
+    NewResources = get_resources_by_types(TargetResources, RemoteResources),
+    NewFoundResources = add_resources_if_new(NewResources, FoundResources),
+    case From of
         noreply ->
             ok;
         _ ->
-            gen_server:cast({?SERVER, ReplyTo}, {trade_resources, {noreply, LocalResources}})
+            gen_server:cast({?SERVER, From}, {trade_resources, {noreply, LocalResources}})
     end,
-    {noreply, State#{found_resources => NewFoundResources}}.
+    {noreply, State#{found_resources => NewFoundResources}};
+handle_cast(_Request, State) ->
+    {noreply, State}.
 
 -spec terminate(term(), state()) -> ok.
 terminate(_Reason, _State) ->
@@ -130,38 +145,38 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal functions
 %%====================================================================
 
-%% @doc Adds a resource to the resources map.
--spec add_resource(term(), pid(), map()) -> map().
-add_resource(ResourceType, Resource, Resources) ->
-    ResourceList = maps:get(ResourceType, Resources, []),
-    NewResourceList =
-        case lists:member(Resource, ResourceList) of
-            true ->
-                ResourceList;
-            false ->
-                [Resource | ResourceList]
-        end,
-    maps:put(ResourceType, NewResourceList, Resources).
+-spec add_unique_resource(term(), list()) -> list().
+add_unique_resource(Resource, ResourceList) ->
+    case lists:member(Resource, ResourceList) of
+        true ->
+            ResourceList;
+        false ->
+            [Resource | ResourceList]
+    end.
 
-%% @doc Adds multiple resources to the resources map.
--spec add_resources([{term(), term()}], map()) -> map().
-add_resources(NewResources, ResourcesData) ->
-    lists:foldl(fun({ResourceType, Resource}, Resources) ->
-                   add_resource(ResourceType, Resource, Resources)
+-spec add_resource_if_new(resource_type(), resource(), resources()) -> resources().
+add_resource_if_new(Type, Resource, Resources) ->
+    ResourceList = maps:get(Type, Resources, []),
+    NewResourceList = add_unique_resource(Resource, ResourceList),
+    maps:put(Type, NewResourceList, Resources).
+
+-spec add_resources_if_new([{resource_type(), resource()}], resources()) -> resources().
+add_resources_if_new(NewResources, OldResources) ->
+    lists:foldl(fun({Type, Resource}, Resources) ->
+                   add_resource_if_new(Type, Resource, Resources)
                 end,
-                ResourcesData,
+                OldResources,
                 NewResources).
 
-%% @doc Returns resources matching the specified resource types.
--spec resources_by_types(list(), map()) -> [{term(), term()}].
-resources_by_types(TargetResources, RemoteResources) ->
-    lists:foldl(fun(ResourceType, Resources) ->
-                   case maps:find(ResourceType, RemoteResources) of
-                       {ok, ResourceList} ->
-                           [{ResourceType, Resource} || Resource <- ResourceList] ++ Resources;
-                       error ->
-                           Resources
-                   end
-                end,
-                [],
-                TargetResources).
+-spec get_resources_by_types([resource_type()], resources()) ->
+                                [{resource_type(), resource()}].
+get_resources_by_types(Types, Resources) ->
+    lists:flatmap(fun(Type) ->
+                     case maps:find(Type, Resources) of
+                         {ok, ResourceList} ->
+                             [{Type, Resource} || Resource <- ResourceList];
+                         error ->
+                             []
+                     end
+                  end,
+                  Types).

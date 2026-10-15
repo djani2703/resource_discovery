@@ -43,7 +43,7 @@ The `resource_discovery_server` maintains three types of state:
 
 * `target_resources` — resource types this node wants to discover
 * `local_resources` — resources available on this node
-* `found_resources` — resources discovered on other nodes
+* `found_resources` — matching resources found locally or on connected nodes
 
 Resources are exchanged between connected Erlang nodes using Erlang message passing.
 
@@ -83,22 +83,24 @@ The resource discovery can then be used through its public API:
 
 Add a resource type to discover:
 ```erlang
-resource_discovery_server:add_target_resource_type(database).
+resource_discovery_server:add_target_resource(database).
 ```
 
 Add a local resource:
 ```erlang
-resource_discovery_server:add_local_resource(database, ResourcePid).
+resource_discovery_server:add_local_resource(database, ResourceNode).
 ```
 
 Exchange resources with connected nodes:
 ```erlang
 resource_discovery_server:trade_resources().
 ```
+The call waits five seconds when remote nodes are connected. This is a fixed delay, not
+confirmation that every node replied.
 
 Fetch discovered resources:
 ```erlang
-resource_discovery_server:fetch_resources(database).
+resource_discovery_server:get_resources(database).
 ```
 
 ## License
